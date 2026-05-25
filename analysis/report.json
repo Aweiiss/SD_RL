@@ -1,0 +1,46 @@
+{
+  "timestamp": "1779532230.8828163",
+  "configs": {
+    "vanilla": {
+      "step": {
+        "mean": 48.04210526315789,
+        "std": 26.96973578290017,
+        "min": 1.0,
+        "max": 95.0,
+        "median": 48.0,
+        "count": 95
+      },
+      "epoch": {
+        "mean": 0.49473684210526314,
+        "std": 0.49997229840159646,
+        "min": 0.0,
+        "max": 1.0,
+        "median": 0.0,
+        "count": 95
+      },
+      "mfu_actor": {
+        "mean": 33.496933154041685,
+        "std": 31.8746887053526,
+        "min": 0.09100270231779246,
+        "max": 64.0,
+        "median": 64.0,
+        "count": 182
+      },
+      "mfu_actor_infer": {
+        "mean": 0.18898659811018756,
+        "std": 0.05133587869070785,
+        "min": 0.09100270231779246,
+        "max": 0.2652205234241923,
+        "median": 0.21063824158502187,
+        "count": 87
+      }
+    },
+    "spec_fixed": {},
+    "spec_adaptive": {}
+  },
+  "comparisons": {
+    "spec_fixed_vs_vanilla": {},
+    "spec_adaptive_vs_vanilla": {},
+    "spec_adaptive_vs_spec_fixed": {}
+  }
+}

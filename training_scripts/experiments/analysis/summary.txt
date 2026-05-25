@@ -1,0 +1,6 @@
+SPEC-RL EXPERIMENT COMPARISON
+======================================================================
+
+Logs analyzed:
+  spec_adaptive: /home/lingquh1xx/L2598/Temp/verl/logs/spec_adaptive_20260523_063129.log
+

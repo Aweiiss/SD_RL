@@ -18,10 +18,15 @@ PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
 
+import gc
+import glob
 import json
 import os
+import re
 import uuid
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from pprint import pprint
 from typing import Any, Optional
 
@@ -60,11 +65,20 @@ from verl.utils import tensordict_utils as tu
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
-from verl.utils.import_utils import load_class_from_fqn
+from verl.utils.import_utils import deprecated, load_class_from_fqn
 from verl.utils.metric import reduce_metrics
 from verl.utils.py_functional import rename_dict
 from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
+from verl.utils.speculative_decoding import (
+    AdaptiveWindowBucket,
+    align_prev_to_gen,
+    build_ctx,
+    rand_reuse_all_cut,
+    rand_reuse_cut,
+    spec_cut,
+    spec_cut_with_knobs,
+)
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.config import DistillationConfig, EngineConfig
@@ -230,6 +244,9 @@ def compute_advantage(
     return data
 
 
+@deprecated(
+    "main_ppo.py is deprecated, and wil be replaced by main_ppo_sync.py in v0.8.0, please use main_ppo_sync.py instead."
+)
 class RayPPOTrainer:
     """Distributed PPO trainer using Ray for scalable reinforcement learning.
 
@@ -316,6 +333,7 @@ class RayPPOTrainer:
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
         self.checkpoint_manager = None
+        self._init_dump_executor()
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
@@ -399,10 +417,11 @@ class RayPPOTrainer:
         except Exception as e:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
 
-    def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
-        """Dump rollout/validation samples as JSONL."""
+    @staticmethod
+    def _write_generations(inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path, global_steps):
+        """Write generation samples as JSONL (runs in background thread)."""
         os.makedirs(dump_path, exist_ok=True)
-        filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
+        filename = os.path.join(dump_path, f"{global_steps}.jsonl")
 
         n = len(inputs)
         base_data = {
@@ -410,22 +429,99 @@ class RayPPOTrainer:
             "output": outputs,
             "gts": gts,
             "score": scores,
-            "step": [self.global_steps] * n,
+            "step": [global_steps] * n,
         }
 
         for k, v in reward_extra_infos_dict.items():
             if len(v) == n:
                 base_data[k] = v
 
-        lines = []
-        for i in range(n):
-            entry = {k: v[i] for k, v in base_data.items()}
-            lines.append(json.dumps(entry, ensure_ascii=False, default=str))
-
         with open(filename, "w") as f:
-            f.write("\n".join(lines) + "\n")
+            for i in range(n):
+                entry = {k: v[i] for k, v in base_data.items()}
+                f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
 
         print(f"Dumped generations to {filename}")
+
+    def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
+        """Dump rollout/validation samples as JSONL asynchronously."""
+        global_steps = self.global_steps
+        future = self._dump_executor.submit(
+            self._write_generations,
+            inputs,
+            outputs,
+            gts,
+            scores,
+            reward_extra_infos_dict,
+            dump_path,
+            global_steps,
+        )
+        self._dump_futures.append(future)
+        # Clean up completed futures and surface any exceptions early
+        still_pending = []
+        for f in self._dump_futures:
+            if f.done():
+                f.result()  # re-raises if the write failed
+            else:
+                still_pending.append(f)
+        self._dump_futures = still_pending
+
+    def _init_dump_executor(self):
+        """Create or recreate the dump executor and futures list."""
+        self._dump_executor = ThreadPoolExecutor(max_workers=1)
+        self._dump_futures = []
+
+    def _shutdown_dump_executor(self):
+        """Drain pending dump futures and shut down the executor."""
+        for f in self._dump_futures:
+            f.result()
+        self._dump_futures.clear()
+        self._dump_executor.shutdown(wait=True)
+
+    def _dump_generations_pt(
+        self,
+        inputs: list[str],
+        outputs: list[str],
+        scores: list[float],
+        log_probs: list[list[float]],  # token-level log p
+        reward_extra_infos_dict: dict[str, Any],
+        dump_path: str,
+        response_masks,
+        responses,
+        position_ids,
+    ):
+        """Dump rollout/validation samples as .pt (torch.save)."""
+        os.makedirs(dump_path, exist_ok=True)
+        filename = os.path.join(dump_path, f"{self.global_steps}.pt")
+
+        # sort uniformly (keep the same order as the original JSONL)
+        order = sorted(range(len(inputs)), key=lambda i: inputs[i])
+        order_idx = torch.tensor(order)
+
+        # 1. reorder directly at tensor level
+        data = {
+            "step": torch.tensor(self.global_steps),
+            "input": [inputs[i] for i in order],
+            "output": [outputs[i] for i in order],
+            "score": torch.tensor([scores[i] for i in order], dtype=torch.float32),
+            "log_probs": (log_probs.index_select(0, order_idx).to(torch.float32)),
+            "response_masks": (response_masks.index_select(0, order_idx)),
+            "responses": (responses.index_select(0, order_idx)),
+            "position_ids": (position_ids.index_select(0, order_idx)),
+            "orig_idx": torch.tensor(order, dtype=torch.int32),
+        }
+
+        # 2. other extra fields
+        for k, v in reward_extra_infos_dict.items():
+            if len(v) == len(inputs):
+                data[k] = (
+                    torch.tensor([v[i] for i in order]) if isinstance(v[0], int | float) else [v[i] for i in order]
+                )
+            else:
+                data[k] = v
+        # 3. save
+        torch.save(data, filename)
+        print(f"[dump] {len(inputs)} samples → {filename}")
 
     def _log_rollout_data(
         self, batch: DataProto, reward_extra_infos_dict: dict, timing_raw: dict, rollout_data_dir: str
@@ -444,7 +540,7 @@ class RayPPOTrainer:
             sample_gts = [item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in batch]
 
             reward_extra_infos_to_dump = {
-                k: (v.tolist() if isinstance(v, np.ndarray) else v) for k, v in reward_extra_infos_dict.items()
+                k: (v.tolist() if hasattr(v, "tolist") else v) for k, v in reward_extra_infos_dict.items()
             }
             if "request_id" in batch.non_tensor_batch:
                 reward_extra_infos_to_dump.setdefault(
@@ -460,6 +556,29 @@ class RayPPOTrainer:
                 reward_extra_infos_dict=reward_extra_infos_to_dump,
                 dump_path=rollout_data_dir,
             )
+
+            spec_decoding = self.config.trainer.get("spec_decoding", False)
+            if spec_decoding:
+                sid = ((self.global_steps - 1) % self.num_buckets) + 1
+                self.latest_old_policy[sid].append(os.path.join(rollout_data_dir, f"{self.global_steps}.jsonl"))
+                self._dump_generations_pt(
+                    inputs=inputs,
+                    outputs=outputs,
+                    scores=scores,
+                    log_probs=batch.batch["old_log_probs"],
+                    reward_extra_infos_dict=reward_extra_infos_dict,
+                    dump_path=rollout_data_dir,
+                    response_masks=batch.batch["response_mask"],
+                    responses=batch.batch["responses"],
+                    position_ids=batch.batch["position_ids"],
+                )
+                pt_list = self.latest_old_policy_tensor[sid]
+                # 记录 (epoch, filepath)，用于按epoch清理
+                current_epoch = int(getattr(self, '_current_epoch', 0))
+                pt_list.append((current_epoch, os.path.join(rollout_data_dir, f"{self.global_steps}.pt")))
+                # Hard limit: keep at most 3 files per bucket to prevent RAM bloat
+                if len(pt_list) > 3:
+                    self.latest_old_policy_tensor[sid] = pt_list[-3:]
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
@@ -1127,6 +1246,45 @@ class RayPPOTrainer:
         )
         metrics.update(global_balance_stats)
 
+    def _preload_rollout_lists(self, rollout_data_dir):
+        """build two defaultdict(list), containing all completed files in the current directory."""
+        rollout_root = Path(rollout_data_dir)
+
+        step_re = re.compile(r"(\d+)\.(jsonl|pt)$")
+        pol_txt = defaultdict(list)  # {sid: [jsonl1, jsonl2, ...]}
+        pol_pt = defaultdict(list)  # {sid: [(epoch, pt1), ...]}
+
+        # estimate steps_per_epoch from num_buckets (best effort)
+        steps_per_epoch = self.num_buckets
+
+        for fn in glob.glob(str(rollout_root / "*.[jp][st]*")):
+            m = step_re.search(fn)
+            if not m:  # skip strange names
+                continue
+            step = int(m.group(1))  # 123.jsonl -> 123
+            sid = ((step - 1) % self.num_buckets) + 1
+            if step <= self.global_steps - 1:  # only collect completed step
+                # estimate which epoch this step belongs to
+                saved_epoch = (step - 1) // steps_per_epoch
+                if m.group(2) == "jsonl":
+                    pol_txt[sid].append(fn)
+                else:
+                    pol_pt[sid].append((saved_epoch, fn))
+
+        # ensure same sid is sorted by step
+        for sid, lst in pol_txt.items():
+            lst.sort(key=lambda p: int(Path(p).stem))
+        for sid, lst in pol_pt.items():
+            lst.sort(key=lambda p: int(Path(p[1]).stem))
+
+        self.latest_old_policy = pol_txt
+        self.latest_old_policy_tensor = pol_pt
+
+        print(
+            f"[INIT] preload txt={sum(len(v) for v in pol_txt.values())}  "
+            f"pt={sum(len(v) for v in pol_pt.values())}  files"
+        )
+
     def _compute_values(self, batch: DataProto) -> DataProto:
         batch_td = batch.to_tensordict()
         # step 2: convert from padding to nopadding
@@ -1278,6 +1436,9 @@ class RayPPOTrainer:
         to construct the PPO dataflow.
         The light-weight advantage computation is done on the driver process.
         """
+        if self._dump_executor._shutdown:
+            self._init_dump_executor()
+
         from omegaconf import OmegaConf
 
         from verl.utils.tracking import Tracking
@@ -1305,6 +1466,7 @@ class RayPPOTrainer:
             pprint(f"Initial validation metrics: {val_metrics}")
             logger.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
+                self._shutdown_dump_executor()
                 return
 
         if self.config.actor_rollout_ref.rollout.skip.get("enable", False):
@@ -1319,6 +1481,18 @@ class RayPPOTrainer:
         last_val_metrics = None
         self.max_steps_duration = 0
 
+        # Speculative decoding init
+        self.latest_old_policy = defaultdict(list)
+        self.latest_old_policy_tensor = defaultdict(list)
+        self.adaptive_window_buckets = {}  # sid -> AdaptiveWindowBucket
+        self.spec_stats = defaultdict(lambda: defaultdict(float))  # per-sid stats
+
+        rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
+        self.num_buckets = len(self.train_dataloader)
+        if rollout_data_dir:
+            self._preload_rollout_lists(rollout_data_dir)
+
+        time_accumulation = 0.0
         prev_step_profile = False
         curr_step_profile = (
             self.global_steps in self.config.global_profiler.steps
@@ -1326,8 +1500,21 @@ class RayPPOTrainer:
             else False
         )
         next_step_profile = False
+        # breakpoint()
+        # Cache spec_decoding config once (avoid repeated dict lookup)
+        _spec_decoding_enabled = self.config.trainer.get("spec_decoding", False)
 
         for epoch in range(current_epoch, self.config.trainer.total_epochs):
+            self._current_epoch = epoch
+            # ---- epoch boundary cleanup: drop data from epochs before prev epoch ----
+            if epoch >= 2 and _spec_decoding_enabled:
+                keep_epoch = epoch - 1  # only keep prev epoch's data
+                for sid, pt_list in self.latest_old_policy_tensor.items():
+                    # pt_list elements are (saved_epoch, filepath)
+                    filtered = [(e, fp) for e, fp in pt_list if e >= keep_epoch]
+                    if len(filtered) < len(pt_list):
+                        self.latest_old_policy_tensor[sid] = filtered
+
             for batch_dict in self.train_dataloader:
                 if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
                     self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=False)
@@ -1347,6 +1534,10 @@ class RayPPOTrainer:
                 batch.non_tensor_batch["uid"] = np.array(
                     [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
                 )
+
+                # NOTE: speculative decoding reads prompt tensors from
+                # combined_gen_batch.non_tensor_batch["prompt"] (text) and
+                # encodes on-the-fly.  No tensor stash needed.
 
                 gen_batch = self._get_gen_batch(batch)
 
@@ -1370,20 +1561,346 @@ class RayPPOTrainer:
                     num_sampled_prompts = len(gen_batch_output)
 
                 is_last_step = self.global_steps >= self.total_training_steps
+                spec_decoding = self.config.trainer.get("spec_decoding", False)
                 with marked_timer("step", timing_raw):
-                    # generate a batch
+                    # ====================================================================
+                    # Speculative Decoding with Adaptive Window Buckets
+                    # ====================================================================
+                    have_pre_rollouts = False
+                    spec_ctx = {}  # holds intermediate tensors for post-rollout merge
+                    spec_decoding = self.config.trainer.get("spec_decoding", False)
+                    with marked_timer("step", timing_raw):
+                        if spec_decoding:
+                            sid = ((self.global_steps - 1) % self.num_buckets) + 1
+                            prev_pts = self.latest_old_policy_tensor[sid]
+                            have_pre_rollouts = len(prev_pts) > 0
+
+                            if have_pre_rollouts:
+                                with marked_timer("pre_log_probs", timing_raw, color="blue"):
+                                    # prev_pts[-1] is (epoch, filepath); load the filepath
+                                    prev_filepath = prev_pts[-1][1] if isinstance(prev_pts[-1], tuple) else prev_pts[-1]
+                                    prev_data = torch.load(prev_filepath, map_location="cpu", weights_only=False)
+                                    N = self.config.actor_rollout_ref.rollout.n
+                                    aligned = align_prev_to_gen(
+                                        prev_data=prev_data,
+                                        gen_batch=combined_gen_batch,
+                                        tokenizer=self.tokenizer,
+                                        n_repeat=N,
+                                    )
+                                    perm = aligned["perm"]
+                                    aligned_old_logp = aligned["log_probs"]
+                                    aligned_old_response_mask = prev_data["response_masks"].index_select(0, perm)
+                                    aligned_old_responses = prev_data["responses"].index_select(0, perm)
+                                    aligned_position_ids = prev_data["position_ids"].index_select(0, perm)
+
+                                    if self.tokenizer.pad_token is None:
+                                        self.tokenizer.pad_token = self.tokenizer.eos_token
+
+                                    # ---- encode prompt text → token tensors ----
+                                    # The ONLY reliable data after _get_gen_batch is prompt TEXT
+                                    # in non_tensor_batch["prompt"].  Encoding is deterministic.
+                                    _dev = aligned_old_response_mask.device
+                                    prompt_texts = combined_gen_batch.non_tensor_batch.get("prompt", [])
+                                    # Force to list[str] – tokenizer rejects np.array
+                                    prompt_texts = [str(x) for x in prompt_texts]
+                                    if not prompt_texts:
+                                        raise KeyError("'prompt' text not found for spec-decoding")
+                                    _enc = self.tokenizer(
+                                        prompt_texts,
+                                        padding=True,
+                                        truncation=True,
+                                        max_length=self.config.data.max_prompt_length,
+                                        return_tensors="pt",
+                                    )
+                                    prompt_ids = _enc["input_ids"].to(_dev)
+                                    prompt_attn_mask = _enc["attention_mask"].to(_dev)
+                                    prompt_pos_ids = (torch.cumsum(_enc["attention_mask"], dim=1) - 1).to(_dev)
+
+                                    # ---- compute new logp on old responses ----
+                                    attention_mask = torch.cat([prompt_attn_mask, aligned_old_response_mask], dim=1)
+                                    input_ids = torch.cat([prompt_ids, aligned_old_responses], dim=-1)
+                                    pre_prob_data = DataProto.from_single_dict({
+                                        "responses": aligned_old_responses,
+                                        "input_ids": input_ids,
+                                        "attention_mask": attention_mask,
+                                        "position_ids": aligned_position_ids,
+                                    })
+                                    pre_log_probs = self.actor_rollout_wg.compute_log_prob(pre_prob_data)
+                                    old_logp = aligned_old_logp
+                                    new_logp = pre_log_probs.batch["old_log_probs"]
+                                    response_mask = aligned_old_response_mask
+
+                                    # 释放prev_data，防止CPU内存泄漏
+                                    del prev_data
+                                    # Periodic gc to prevent RAM bloat (every 5 steps)
+                                    if self.global_steps % 5 == 0:
+                                        gc.collect()
+
+                                    # ---- adaptive window bucket ----
+                                    B_all, R = new_logp.shape
+                                    if sid not in self.adaptive_window_buckets:
+                                        self.adaptive_window_buckets[sid] = AdaptiveWindowBucket(response_len=R)
+                                    awb = self.adaptive_window_buckets[sid]
+                                    current_window = awb.current_window
+
+                                    # If disabled, fall through to standard generation
+                                    if not awb.enabled:
+                                        have_pre_rollouts = False
+                                    else:
+                                        # Clamp response_mask to current window for speculation
+                                        window_mask = response_mask.clone()
+                                        if current_window < R:
+                                            window_mask[:, current_window:] = 0
+
+                                        spec_bias = self.config.trainer.get("spec_bias", 0.0)
+                                        random_reuse = self.config.trainer.get("random_reuse", 0.0)
+                                        random_reuse_all = self.config.trainer.get("random_reuse_all", 0.0)
+
+                                        if random_reuse_all > 0.0:
+                                            out = rand_reuse_all_cut(
+                                                old_logp=old_logp,
+                                                new_logp=new_logp,
+                                                response_mask=window_mask,
+                                                reuse_prob=random_reuse_all,
+                                                seed=self.global_steps,
+                                            )
+                                        elif random_reuse > 0.0:
+                                            out = rand_reuse_cut(
+                                                old_logp=old_logp,
+                                                new_logp=new_logp,
+                                                response_mask=window_mask,
+                                                reuse_prob=random_reuse,
+                                                seed=self.global_steps,
+                                            )
+                                        elif spec_bias == 0.0:
+                                            out = spec_cut(
+                                                old_logp=old_logp,
+                                                new_logp=new_logp,
+                                                response_mask=window_mask,
+                                                p_abs_thresh=None,
+                                                seed=self.global_steps,
+                                            )
+                                        else:
+                                            # Use spec_bias directly: positive = stricter, negative = lenient
+                                            out = spec_cut_with_knobs(
+                                                old_logp=old_logp,
+                                                new_logp=new_logp,
+                                                response_mask=window_mask,
+                                                bias=spec_bias,
+                                                scale=1.0,
+                                                p_abs_thresh=None,
+                                                seed=self.global_steps,
+                                            )
+
+                                        cut_idx = out["cut_idx"]  # [B]
+                                        idx_reuse = out["idx_reuse"]  # [Nr]
+                                        idx_need = out["idx_need"]  # [Nn]
+
+                                        # ---- update adaptive window bucket ----
+                                        avg_cut = int(cut_idx.float().mean().item())
+                                        avg_resp_len = int(window_mask.sum(dim=1).float().mean().item())
+                                        awb_info = awb.update(avg_cut, avg_resp_len)
+                                        metrics.update(out["metrics"])
+                                        metrics["spec/window"] = current_window
+                                        metrics["spec/next_window"] = awb_info["next_window"]
+                                        metrics["spec/awb_action"] = awb_info["action"]
+                                        metrics["spec/awb_enabled"] = float(awb_info["enabled"])
+                                        # Per-sample reuse ratio distribution
+                                        reuse_ratio = out.get("per_sample_reuse_ratio")
+                                        if reuse_ratio is not None and reuse_ratio.numel() > 0:
+                                            rr = reuse_ratio.cpu().numpy()
+                                            metrics["spec/rr_0_20"] = float((rr < 0.2).mean())
+                                            metrics["spec/rr_20_40"] = float(((rr >= 0.2) & (rr < 0.4)).mean())
+                                            metrics["spec/rr_40_60"] = float(((rr >= 0.4) & (rr < 0.6)).mean())
+                                            metrics["spec/rr_60_80"] = float(((rr >= 0.6) & (rr < 0.8)).mean())
+                                            metrics["spec/rr_80_100"] = float((rr >= 0.8).mean())
+
+                                        # ---- save context for post-rollout merge ----
+                                        spec_ctx = {
+                                            "cut_idx": cut_idx,
+                                            "idx_reuse": idx_reuse,
+                                            "idx_need": idx_need,
+                                            "prompt_ids": prompt_ids,
+                                            "prompt_attn_mask": prompt_attn_mask,
+                                            "prompt_pos_ids": prompt_pos_ids,
+                                            "aligned_old_responses": aligned_old_responses,
+                                            "aligned_old_response_mask": aligned_old_response_mask,
+                                            "aligned_position_ids": aligned_position_ids,
+                                            "R": R,
+                                        }
+
+                                        # ---- build need_dp (partial regeneration subset) ----
+                                        if idx_need.numel() > 0:
+                                            rows = idx_need
+                                            # Use already-encoded prompt tensors (from spec-decoding block above)
+                                            p_ids = prompt_ids[rows]
+                                            p_msk = prompt_attn_mask[rows]
+                                            p_pos = prompt_pos_ids[rows]
+                                            ctx_ids, ctx_msk, ctx_pos, max_k = build_ctx(
+                                                p_ids,
+                                                p_msk,
+                                                p_pos,
+                                                aligned_old_responses[rows],
+                                                cut_idx[rows],
+                                                pad_id=self.tokenizer.pad_token_id,
+                                            )
+                                            need_dp = DataProto.from_single_dict({
+                                                "input_ids": ctx_ids,
+                                                "attention_mask": ctx_msk,
+                                                "position_ids": ctx_pos,
+                                                "prompts": p_ids,  # keep original prompt length for _postprocess consistency
+                                            })
+                                            need_dp.meta_info = dict(gen_batch.meta_info)
+                                            # Max tokens to generate = R - cut_idx for each row
+                                            per_req_np = (
+                                                out["per_request_max_new_tokens"][idx_need.cpu()]
+                                                .detach()
+                                                .cpu()
+                                                .numpy()
+                                                .astype(np.int32)
+                                            )
+                                            need_dp.non_tensor_batch["per_request_max_new_tokens"] = per_req_np
+                                            need_dp.meta_info["spec_decoding"] = True
+
+                                            size_divisor = (
+                                                self.actor_rollout_wg.world_size
+                                                if not self.async_rollout_mode
+                                                else self.config.actor_rollout_ref.rollout.agent.num_workers
+                                            )
+                                            need_dp_padded, pad_size = pad_dataproto_to_divisor(need_dp, size_divisor)
+                                            spec_ctx["need_pad_size"] = pad_size
+
+                                            # Build the combined_gen_batch replacement:
+                                            # Only idx_need rows go through generation.
+                                            # idx_reuse rows will use old responses directly.
+                                            combined_gen_batch_for_gen = need_dp_padded
+                                            spec_ctx["need_was_padded"] = True
+                                        else:
+                                            # All rows fully reused — skip generation entirely
+                                            combined_gen_batch_for_gen = None
+                                            spec_ctx["need_was_padded"] = False
+
+                    # ====================================================================
+                    # Generation (standard or spec-decoded subset)
+                    # ====================================================================
                     with marked_timer("gen", timing_raw, color="red"):
                         if curr_step_profile:
                             self.llm_server_manager.start_profile()
-                        combined_gen_output = self.async_rollout_manager.generate_sequences(combined_gen_batch)
-                        self.checkpoint_manager.sleep_replicas()
+
+                        if spec_decoding and have_pre_rollouts:
+                            if combined_gen_batch_for_gen is not None:
+                                # Generate only for idx_need subset
+                                need_gen_output = self.async_rollout_manager.generate_sequences(
+                                    combined_gen_batch_for_gen
+                                )
+                                self.checkpoint_manager.sleep_replicas()
+                                # Unpad to get actual generated results
+                                if spec_ctx.get("need_was_padded"):
+                                    need_gen_output = unpad_dataproto(need_gen_output, pad_size=spec_ctx["need_pad_size"])
+                                spec_ctx["need_gen_output"] = need_gen_output
+                            else:
+                                # All reused — no generation needed
+                                spec_ctx["need_gen_output"] = None
+                        else:
+                            # Standard (non-spec) generation
+                            combined_gen_output = self.async_rollout_manager.generate_sequences(combined_gen_batch)
+                            self.checkpoint_manager.sleep_replicas()
+                            timing_raw.update(combined_gen_output.meta_info["timing"])
+                            combined_gen_output.meta_info.pop("timing", None)
+
                         if curr_step_profile:
                             self.llm_server_manager.stop_profile()
 
-                        timing_raw.update(combined_gen_output.meta_info["timing"])
-                        combined_gen_output.meta_info.pop("timing", None)
+                    # ====================================================================
+                    # Post-rollout: merge reused and newly-generated responses
+                    # ====================================================================
+                    if spec_decoding and have_pre_rollouts and spec_ctx:
+                        with marked_timer("post-rollout", timing_raw, color="red"):
+                            ctx = spec_ctx
+                            cut_idx = ctx["cut_idx"]
+                            idx_reuse = ctx["idx_reuse"]
+                            idx_need = ctx["idx_need"]
+                            prompt_ids = ctx["prompt_ids"]
+                            prompt_attn_mask = ctx["prompt_attn_mask"]
+                            prompt_pos_ids = ctx["prompt_pos_ids"]
+                            aligned_old_responses = ctx["aligned_old_responses"]
+                            aligned_old_response_mask = ctx["aligned_old_response_mask"]
+                            R = ctx["R"]
+                            B = prompt_ids.shape[0]
+                            P = prompt_ids.shape[1]
+                            pad_id = self.tokenizer.pad_token_id
 
-                    gen_batch_output = combined_gen_output.slice(0, num_sampled_prompts)
+                            # Pre-allocate final tensors
+                            final_inputs = torch.full((B, P + R), pad_id, dtype=prompt_ids.dtype, device=prompt_ids.device)
+                            final_attn = torch.zeros((B, P + R), dtype=prompt_attn_mask.dtype, device=prompt_ids.device)
+                            final_pos = torch.zeros((B, P + R), dtype=prompt_pos_ids.dtype, device=prompt_ids.device)
+                            final_resp = torch.full((B, R), pad_id, dtype=prompt_ids.dtype, device=prompt_ids.device)
+
+                            # Fill prompt segment (all rows)
+                            final_inputs[:, :P] = prompt_ids
+                            final_attn[:, :P] = prompt_attn_mask
+                            final_pos[:, :P] = prompt_pos_ids
+
+                            delta = torch.arange(1, R + 1, dtype=prompt_pos_ids.dtype, device=prompt_ids.device)
+
+                            # --- idx_reuse: full old response copy ---
+                            if idx_reuse.numel() > 0:
+                                final_resp[idx_reuse] = aligned_old_responses[idx_reuse]
+                                final_attn[idx_reuse, P:P + R] = aligned_old_response_mask[idx_reuse]
+                                last_pos_reuse = prompt_pos_ids[idx_reuse, -1].unsqueeze(1)
+                                final_pos[idx_reuse, P:P + R] = last_pos_reuse + delta
+
+                            # --- idx_need: prefix-reuse + new generation ---
+                            if idx_need.numel() > 0 and ctx.get("need_gen_output") is not None:
+                                need_gen_output = ctx["need_gen_output"]
+                                new_resp = need_gen_output.batch["responses"]  # [Nn, R]
+
+                                for row_in_sub, i in enumerate(idx_need.tolist()):
+                                    k = int(cut_idx[i].item())
+                                    keep_pref = min(k, R)
+                                    take_new = R - keep_pref
+
+                                    if keep_pref > 0:
+                                        final_resp[i, :keep_pref] = aligned_old_responses[i, :keep_pref]
+                                    if take_new > 0:
+                                        final_resp[i, keep_pref:keep_pref + take_new] = new_resp[row_in_sub, :take_new]
+
+                                # Reconstruct response mask for need rows
+                                nr = idx_need.long()
+                                need_resp_full = final_resp[nr]
+                                is_pad = need_resp_full == pad_id
+                                has_pad = is_pad.any(dim=1)
+                                first_pad_idx = torch.argmax(is_pad.to(torch.int32), dim=1)
+                                first_pad_idx = torch.where(has_pad, first_pad_idx, torch.full_like(first_pad_idx, R))
+                                L_inclusive = torch.where(
+                                    has_pad,
+                                    first_pad_idx + 1,
+                                    torch.full_like(first_pad_idx, R),
+                                )
+                                col = torch.arange(R, dtype=prompt_attn_mask.dtype, device=prompt_ids.device).unsqueeze(0)
+                                resp_mask_need = (col < L_inclusive.unsqueeze(1)).to(prompt_attn_mask.dtype)
+
+                                final_attn[nr, P:P + R] = resp_mask_need
+                                last_pos_need = prompt_pos_ids[nr, -1].unsqueeze(1)
+                                final_pos[nr, P:P + R] = last_pos_need + delta
+                                final_inputs[:, P:P + R] = final_resp
+
+                            # Assemble final DataProto
+                            merged = {
+                                "prompts": prompt_ids,
+                                "responses": final_resp,
+                                "input_ids": final_inputs,
+                                "attention_mask": final_attn,
+                                "position_ids": final_pos,
+                            }
+                            gen_batch_output = DataProto.from_single_dict(merged)
+
+                            # Meta info: carry over timing if any
+                            gen_batch_output.meta_info = {}
+                    else:
+                        # Standard path: slice sampled prompts from combined output
+                        gen_batch_output = combined_gen_output.slice(0, num_sampled_prompts)
+
                     if "__do_sample__" in gen_batch_output.non_tensor_batch:
                         gen_batch_output.pop(non_tensor_batch_keys=["__do_sample__"])
 
@@ -1404,6 +1921,7 @@ class RayPPOTrainer:
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
+                    # del gen_batch_output
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
@@ -1625,6 +2143,8 @@ class RayPPOTrainer:
                     }
                 )
                 # collect metrics
+                time_accumulation += timing_raw["step"]
+                timing_raw["time_accumulation"] = time_accumulation
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
                 # GDPO per-component reward metrics
                 gdpo_reward_keys = self.config.algorithm.get("gdpo_reward_keys", None)
@@ -1654,6 +2174,7 @@ class RayPPOTrainer:
                 if is_last_step:
                     if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
                         self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=True)
+                    self._shutdown_dump_executor()
                     pprint(f"Final validation metrics: {last_val_metrics}")
                     progress_bar.close()
                     return
@@ -1663,3 +2184,6 @@ class RayPPOTrainer:
                 if hasattr(self.train_dataset, "on_batch_end"):
                     # The dataset may be changed after each training batch
                     self.train_dataset.on_batch_end(batch=batch)
+
+        # Ensure dump executor is shut down when training loop ends without reaching is_last_step
+        self._shutdown_dump_executor()

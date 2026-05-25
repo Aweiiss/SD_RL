@@ -102,6 +102,7 @@ class RLHFDataset(Dataset):
         self.processor = processor
         self.max_samples = max_samples
         self.config = config
+        self.prompt_type = config.get("prompt_type", None)
 
         self.cache_dir = os.path.expanduser(config.get("cache_dir", "~/.cache/verl/rlhf"))
         self.prompt_key = config.get("prompt_key", "prompt")

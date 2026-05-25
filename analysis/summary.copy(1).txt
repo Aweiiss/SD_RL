@@ -1,0 +1,12 @@
+SPEC-RL EXPERIMENT COMPARISON
+======================================================================
+
+Logs analyzed:
+  vanilla: /home/lingquh1xx/L2598/Temp/verl/logs/vanilla_20260525_015549.log
+  spec_fixed: /home/lingquh1xx/L2598/Temp/verl/logs/spec_fixed_20260525_042405.log
+  spec_adaptive: /home/lingquh1xx/L2598/Temp/verl/logs/spec_adaptive_20260525_042406.log
+
+
+[spec_fixed vs vanilla]
+
+[spec_adaptive vs vanilla]
