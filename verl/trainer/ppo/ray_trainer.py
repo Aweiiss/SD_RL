@@ -493,32 +493,45 @@ class RayPPOTrainer:
         """Dump rollout/validation samples as .pt (torch.save)."""
         os.makedirs(dump_path, exist_ok=True)
         filename = os.path.join(dump_path, f"{self.global_steps}.pt")
+        # Spec dump controls:
+        # - spec_dump_minimal_fields: keep only fields needed by speculative decoding
+        # - spec_dump_logp_fp16: store log_probs in fp16 to reduce disk and RAM pressure
+        dump_minimal = self.config.trainer.get("spec_dump_minimal_fields", True)
+        dump_logp_fp16 = self.config.trainer.get("spec_dump_logp_fp16", False)
 
         # sort uniformly (keep the same order as the original JSONL)
         order = sorted(range(len(inputs)), key=lambda i: inputs[i])
         order_idx = torch.tensor(order)
+        logp_dtype = torch.float16 if dump_logp_fp16 else torch.float32
+        logp_tensor = log_probs.index_select(0, order_idx).to(logp_dtype)
 
         # 1. reorder directly at tensor level
         data = {
             "step": torch.tensor(self.global_steps),
+            # required for align_prev_to_gen prompt matching
             "input": [inputs[i] for i in order],
-            "output": [outputs[i] for i in order],
-            "score": torch.tensor([scores[i] for i in order], dtype=torch.float32),
-            "log_probs": (log_probs.index_select(0, order_idx).to(torch.float32)),
+            "log_probs": logp_tensor,
             "response_masks": (response_masks.index_select(0, order_idx)),
             "responses": (responses.index_select(0, order_idx)),
             "position_ids": (position_ids.index_select(0, order_idx)),
-            "orig_idx": torch.tensor(order, dtype=torch.int32),
         }
 
+        if not dump_minimal:
+            data.update({
+                "output": [outputs[i] for i in order],
+                "score": torch.tensor([scores[i] for i in order], dtype=torch.float32),
+                "orig_idx": torch.tensor(order, dtype=torch.int32),
+            })
+
         # 2. other extra fields
-        for k, v in reward_extra_infos_dict.items():
-            if len(v) == len(inputs):
-                data[k] = (
-                    torch.tensor([v[i] for i in order]) if isinstance(v[0], int | float) else [v[i] for i in order]
-                )
-            else:
-                data[k] = v
+        if not dump_minimal:
+            for k, v in reward_extra_infos_dict.items():
+                if len(v) == len(inputs):
+                    data[k] = (
+                        torch.tensor([v[i] for i in order]) if isinstance(v[0], int | float) else [v[i] for i in order]
+                    )
+                else:
+                    data[k] = v
         # 3. save
         torch.save(data, filename)
         print(f"[dump] {len(inputs)} samples → {filename}")
