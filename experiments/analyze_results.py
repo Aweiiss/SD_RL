@@ -46,7 +46,7 @@ PATTERNS = {
     # Speculative decoding metrics
     "spec_window": re.compile(r"spec/window[^0-9]*([\d.]+)"),
     "spec_next_window": re.compile(r"spec/next_window[^0-9]*([\d.]+)"),
-    "spec_action": re.compile(r"spec/awb_action\s*=\s*(\w+)"),
+    "spec_action": re.compile(r"spec/awb_action\s*[:=]\s*(\w+)"),
     "spec_enabled": re.compile(r"spec/awb_enabled[^0-9]*([\d.]+)"),
     "spec_skip_ratio": re.compile(r"spec/skip_ratio[^0-9]*([\d.]+)"),
     "spec_cont_ratio": re.compile(r"spec/cont_ratio[^0-9]*([\d.]+)"),
@@ -95,6 +95,51 @@ def parse_log_file(log_path):
             results[metric_name] = values
 
     return results
+
+
+def align_data_by_step(parsed_data, steady_ratio=0.3):
+    """Align metrics by step length and keep only steady-state tail."""
+    if not parsed_data:
+        return {}
+
+    step_len = len(parsed_data.get("step", []))
+    if step_len <= 0:
+        return {k: v for k, v in parsed_data.items() if isinstance(v, list) and v}
+
+    start_idx = int(step_len * (1.0 - steady_ratio))
+    start_idx = max(0, min(start_idx, step_len - 1))
+
+    aligned = {}
+    for metric, values in parsed_data.items():
+        if not isinstance(values, list) or not values:
+            continue
+        n = min(len(values), step_len)
+        if n <= 0:
+            continue
+        aligned[metric] = values[start_idx:n]
+    return aligned
+
+
+def align_multi_configs(all_data, cfg_order=("vanilla", "spec_fixed", "spec_adaptive"), steady_ratio=0.3):
+    """Trim configs to same steady-state step count for fair comparison."""
+    prepared = {cfg: align_data_by_step(data, steady_ratio=steady_ratio) for cfg, data in all_data.items()}
+    present = [cfg for cfg in cfg_order if cfg in prepared and prepared[cfg]]
+    if len(present) < 2:
+        return prepared
+
+    step_lens = [len(prepared[cfg].get("step", [])) for cfg in present if prepared[cfg].get("step")]
+    if not step_lens:
+        return prepared
+
+    common_len = min(step_lens)
+    if common_len <= 0:
+        return prepared
+
+    for cfg in present:
+        for metric, values in list(prepared[cfg].items()):
+            if isinstance(values, list) and values:
+                prepared[cfg][metric] = values[-common_len:]
+    return prepared
 
 
 def compute_statistics(values):
@@ -418,6 +463,9 @@ def main():
         data = parse_log_file(log_path)
         all_data[cfg_name] = data
         print(f"    Metrics found: {list(data.keys())}")
+
+    # Step-align data and keep steady-state tail for fair config comparison.
+    all_data = align_multi_configs(all_data, steady_ratio=0.3)
 
     # Print spec-specific stats
     for cfg_name in ["spec_fixed", "spec_adaptive"]:

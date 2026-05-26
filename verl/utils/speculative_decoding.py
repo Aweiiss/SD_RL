@@ -105,13 +105,16 @@ def spec_cut(
     idx_need = torch.nonzero(need_mask, as_tuple=False).squeeze(-1)
     per_request_max_new_tokens = (R - cut_idx).to(torch.long)
 
-    saved_tokens = (resp_len - cut_idx).clamp(min=0)
+    saved_tokens = cut_idx.to(torch.float32)
+    regen_tokens = (resp_len - cut_idx).clamp(min=0).to(torch.float32)
+    regen_tokens = (resp_len - cut_idx).clamp(min=0).to(torch.float32)
     metrics = {
         "spec/skip_ratio": reuse_mask.float().mean().item(),
         "spec/cont_ratio": need_mask.float().mean().item(),
         "spec/avg_cut_idx": cut_idx.float().mean().item(),
         "spec/avg_resp_len": resp_len.float().mean().item(),
-        "spec/avg_saved_tokens": saved_tokens.float().mean().item(),
+        "spec/avg_saved_tokens": saved_tokens.mean().item(),
+        "spec/avg_regen_tokens": regen_tokens.mean().item(),
     }
     return {
         "cut_idx": cut_idx,
@@ -169,6 +172,7 @@ def spec_cut_with_knobs(
     idx_need = torch.nonzero(need_mask, as_tuple=False).squeeze(-1)
 
     saved_tokens = cut_idx.to(torch.float32)
+    regen_tokens = (resp_len - cut_idx).clamp(min=0).to(torch.float32)
     # Per-sample reuse ratio: cut_idx / resp_len (0~1)
     # Guard against resp_len=0 (empty response) → avoid NaN
     safe_resp_len = resp_len.clone()
@@ -179,7 +183,8 @@ def spec_cut_with_knobs(
         "spec/cont_ratio": need_mask.float().mean().item(),
         "spec/avg_cut_idx": cut_idx.float().mean().item(),
         "spec/avg_resp_len": resp_len.float().mean().item(),
-        "spec/avg_saved_tokens": saved_tokens.float().mean().item(),
+        "spec/avg_saved_tokens": saved_tokens.mean().item(),
+        "spec/avg_regen_tokens": regen_tokens.mean().item(),
         "spec/avg_reuse_ratio": reuse_ratio.mean().item(),
         "spec/reuse_ratio_min": reuse_ratio.min().item(),
         "spec/reuse_ratio_max": reuse_ratio.max().item(),
@@ -232,12 +237,14 @@ def rand_reuse_cut(
     per_request_max_new_tokens = (R - cut_idx).to(torch.long)
 
     saved_tokens = cut_idx.to(torch.float32)
+    regen_tokens = (resp_len - cut_idx).clamp(min=0).to(torch.float32)
     metrics = {
         "spec/skip_ratio": reuse_mask.float().mean().item(),
         "spec/cont_ratio": need_mask.float().mean().item(),
         "spec/avg_cut_idx": cut_idx.float().mean().item(),
         "spec/avg_resp_len": resp_len.float().mean().item(),
-        "spec/avg_saved_tokens": saved_tokens.float().mean().item(),
+        "spec/avg_saved_tokens": saved_tokens.mean().item(),
+        "spec/avg_regen_tokens": regen_tokens.mean().item(),
         "spec/random_reuse_p": float(reuse_prob),
     }
     return {
@@ -283,7 +290,8 @@ def rand_reuse_all_cut(
         "spec/cont_ratio": need_mask.float().mean().item(),
         "spec/avg_cut_idx": cut_idx.float().mean().item(),
         "spec/avg_resp_len": resp_len.float().mean().item(),
-        "spec/avg_saved_tokens": saved_tokens.float().mean().item(),
+        "spec/avg_saved_tokens": saved_tokens.mean().item(),
+        "spec/avg_regen_tokens": regen_tokens.mean().item(),
         "spec/random_reuse_all_p": float(reuse_prob),
     }
     return {
@@ -388,7 +396,7 @@ class AdaptiveWindowBucket:
                 self.consecutive_successes = 0
             elif next_idx == self.current_idx:
                 self.consecutive_successes += 1
-                if self.consecutive_successes >= 2 and self.current_idx < self.num_buckets - 1:
+                if self.consecutive_successes >= 1 and self.current_idx < self.num_buckets - 1:
                     # Two consecutive full accepts → increase one bucket
                     next_idx = self.current_idx + 1
                     action = "promote_success"
@@ -408,7 +416,7 @@ class AdaptiveWindowBucket:
                 target_idx = 2  # R/4
             elif r >= 0.4:
                 target_idx = 1  # R/8
-            elif r >= 0.15:
+            elif r >= 0.08:
                 target_idx = 0  # R/16
             else:
                 target_idx = -1  # disable
