@@ -11,6 +11,7 @@ Usage:
 
 import argparse
 import json
+import math
 import os
 import re
 from pathlib import Path
@@ -70,31 +71,109 @@ PATTERNS = {
 }
 
 
-def parse_log_file(log_path):
-    """Parse a training log file and extract per-step metrics.
+def _sanitize_numeric_series(metric_name, values):
+    """Drop non-finite values and obvious outliers using robust MAD filtering."""
+    numeric = []
+    dropped_non_finite = 0
+    for v in values:
+        if isinstance(v, (int, float)) and math.isfinite(v):
+            numeric.append(float(v))
+        else:
+            dropped_non_finite += 1
 
-    Returns a dict mapping metric_name -> list of (step, value) tuples.
-    """
+    if len(numeric) < 5:
+        return numeric, {
+            "raw_count": len(values),
+            "kept_count": len(numeric),
+            "dropped_non_finite": dropped_non_finite,
+            "dropped_outliers": 0,
+            "filter": "none",
+        }
+
+    arr = np.array(numeric, dtype=float)
+    median = float(np.median(arr))
+    mad = float(np.median(np.abs(arr - median)))
+
+    if mad <= 1e-12:
+        return numeric, {
+            "raw_count": len(values),
+            "kept_count": len(numeric),
+            "dropped_non_finite": dropped_non_finite,
+            "dropped_outliers": 0,
+            "filter": "none_mad_zero",
+        }
+
+    robust_z = 0.6745 * (arr - median) / mad
+    keep_mask = np.abs(robust_z) <= 6.0
+
+    # Extra protection for ratio-like metrics expected in [0, 1].
+    if metric_name in {"mfu_actor", "mfu_actor_infer", "spec_skip_ratio", "spec_cont_ratio", "spec_enabled"}:
+        keep_mask &= (arr >= -1e-6) & (arr <= 1.0 + 1e-6)
+
+    filtered = arr[keep_mask].tolist()
+    dropped_outliers = int(len(arr) - np.sum(keep_mask))
+
+    # Avoid over-filtering tiny samples.
+    if len(filtered) < max(3, int(0.3 * len(arr))):
+        filtered = numeric
+        dropped_outliers = 0
+        filter_name = "fallback_keep_all"
+    else:
+        filter_name = "mad_z6"
+
+    return filtered, {
+        "raw_count": len(values),
+        "kept_count": len(filtered),
+        "dropped_non_finite": dropped_non_finite,
+        "dropped_outliers": dropped_outliers,
+        "filter": filter_name,
+    }
+
+
+def parse_log_file(log_path):
+    """Parse a training log file and extract metrics with robust decoding + filtering."""
     path = Path(log_path)
     if not path.exists():
         print(f"[WARNING] Log file not found: {path}")
-        return {}
+        return {}, {}
 
-    text = path.read_text()
+    text = path.read_text(encoding="utf-8", errors="replace")
     results = {}
+    anomalies = {}
+
     for metric_name, pattern in PATTERNS.items():
         matches = pattern.findall(text)
         values = []
         for m in matches:
             try:
-                v = float(m)
-                values.append(v)
+                values.append(float(m))
             except (ValueError, TypeError):
                 continue
-        if values:
-            results[metric_name] = values
 
-    return results
+        if values:
+            filtered, meta = _sanitize_numeric_series(metric_name, values)
+            if filtered:
+                results[metric_name] = filtered
+            if meta["dropped_non_finite"] > 0 or meta["dropped_outliers"] > 0:
+                anomalies[metric_name] = meta
+
+    return results, anomalies
+
+
+def print_anomaly_report(cfg_name, anomalies):
+    """Print anomaly diagnostics for one config."""
+    if not anomalies:
+        print(f"    Anomaly check: no obvious numeric outliers detected")
+        return
+
+    print(f"    Anomaly check: potential issues in {len(anomalies)} metric(s)")
+    for metric, meta in sorted(anomalies.items()):
+        print(
+            "      - "
+            f"{metric}: kept={meta['kept_count']}/{meta['raw_count']}, "
+            f"dropped_non_finite={meta['dropped_non_finite']}, "
+            f"dropped_outliers={meta['dropped_outliers']} (filter={meta['filter']})"
+        )
 
 
 def align_data_by_step(parsed_data, steady_ratio=0.3):
@@ -460,9 +539,10 @@ def main():
     all_data = {}
     for cfg_name, log_path in logs.items():
         print(f"\n  Parsing: {cfg_name} → {log_path}")
-        data = parse_log_file(log_path)
+        data, anomalies = parse_log_file(log_path)
         all_data[cfg_name] = data
         print(f"    Metrics found: {list(data.keys())}")
+        print_anomaly_report(cfg_name, anomalies)
 
     # Step-align data and keep steady-state tail for fair config comparison.
     all_data = align_multi_configs(all_data, steady_ratio=0.3)
