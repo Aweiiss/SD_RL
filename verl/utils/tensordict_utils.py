@@ -755,10 +755,21 @@ def pop(tensordict: TensorDict, key: str, default=None) -> Any:
         >>> "labels" in td.keys()
         False
     """
-    _sentinel = object()
-    output = tensordict.pop(key, _sentinel)
-    if output is _sentinel:
-        return default
+    # DataProto.pop has a different signature (batch_keys=..., no default) and
+    # asserts when key is missing. Some call-sites pass DataProto-like objects
+    # and expect missing keys to cleanly fallback to `default`.
+    if hasattr(tensordict, "batch") and hasattr(tensordict, "non_tensor_batch"):
+        if key in tensordict.batch.keys():
+            output = tensordict.batch.pop(key)
+        elif key in tensordict.non_tensor_batch:
+            output = tensordict.non_tensor_batch.pop(key)
+        else:
+            return default
+    else:
+        _sentinel = object()
+        output = tensordict.pop(key, _sentinel)
+        if output is _sentinel:
+            return default
 
     if isinstance(output, torch.Tensor):
         return output
