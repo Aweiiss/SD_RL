@@ -565,6 +565,21 @@ def _hashable_key(x):
     return str(x)
 
 
+def _normalize_prompt_text_for_match(x):
+    """Best-effort text normalization to improve prompt alignment robustness.
+
+    Handles mixed prompt serialization forms (chat template tags vs plain role text).
+    """
+    s = _hashable_key(x)
+    if not isinstance(s, str):
+        s = str(s)
+    # normalize common chat-template markers
+    s = s.replace("<|im_start|>", "\n").replace("<|im_end|>", "\n")
+    # collapse whitespace and lowercase to reduce formatting-only mismatch
+    s = " ".join(s.split()).strip().lower()
+    return s
+
+
 def align_prev_to_gen(
     *,
     prev_data: dict,
@@ -579,12 +594,12 @@ def align_prev_to_gen(
     # Normalise both sides to hashable keys
     bucket = defaultdict(deque)
     for idx, txt in enumerate(prev_data["input"]):
-        bucket[_hashable_key(txt)].append(idx)
+        bucket[_normalize_prompt_text_for_match(txt)].append(idx)
 
     perm_rows = []
     match_ok = True
     for txt in ref_prompts_raw:
-        key = _hashable_key(txt)
+        key = _normalize_prompt_text_for_match(txt)
         if len(bucket.get(key, ())) < n_repeat:
             match_ok = False
             break
