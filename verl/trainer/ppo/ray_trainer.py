@@ -1285,6 +1285,26 @@ class RayPPOTrainer:
             f"pt={sum(len(v) for v in pol_pt.values())}  files"
         )
 
+    def _load_prev_rollout_tensor(self, filepath: str):
+        """Load previous rollout tensor dict with a tiny bounded in-memory cache.
+
+        This reduces repeated disk I/O for adjacent steps while bounding memory use.
+        """
+        if self._prev_rollout_cache_max <= 0:
+            return torch.load(filepath, map_location="cpu", weights_only=False)
+
+        cached = self._prev_rollout_cache.get(filepath)
+        if cached is not None:
+            return cached
+
+        data = torch.load(filepath, map_location="cpu", weights_only=False)
+        self._prev_rollout_cache[filepath] = data
+        self._prev_rollout_cache_order.append(filepath)
+        while len(self._prev_rollout_cache_order) > self._prev_rollout_cache_max:
+            evict = self._prev_rollout_cache_order.popleft()
+            self._prev_rollout_cache.pop(evict, None)
+        return data
+
     def _compute_values(self, batch: DataProto) -> DataProto:
         batch_td = batch.to_tensordict()
         # step 2: convert from padding to nopadding
@@ -1486,6 +1506,10 @@ class RayPPOTrainer:
         self.latest_old_policy_tensor = defaultdict(list)
         self.adaptive_window_buckets = {}  # sid -> AdaptiveWindowBucket
         self.spec_stats = defaultdict(lambda: defaultdict(float))  # per-sid stats
+        # bounded in-memory cache for previous rollout tensors to reduce repeated disk load latency
+        self._prev_rollout_cache = {}
+        self._prev_rollout_cache_order = deque()
+        self._prev_rollout_cache_max = int(self.config.trainer.get("spec_prev_cache_size", 2))
 
         rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
         self.num_buckets = len(self.train_dataloader)
@@ -1579,7 +1603,7 @@ class RayPPOTrainer:
                                 with marked_timer("pre_log_probs", timing_raw, color="blue"):
                                     # prev_pts[-1] is (epoch, filepath); load the filepath
                                     prev_filepath = prev_pts[-1][1] if isinstance(prev_pts[-1], tuple) else prev_pts[-1]
-                                    prev_data = torch.load(prev_filepath, map_location="cpu", weights_only=False)
+                                    prev_data = self._load_prev_rollout_tensor(prev_filepath)
                                     N = self.config.actor_rollout_ref.rollout.n
                                     aligned = align_prev_to_gen(
                                         prev_data=prev_data,
@@ -1624,6 +1648,8 @@ class RayPPOTrainer:
                                         "input_ids": input_ids,
                                         "attention_mask": attention_mask,
                                         "position_ids": aligned_position_ids,
+                                        # optional key consumed by infer path; explicit default avoids branching mismatch
+                                        "no_lora_adapter": False,
                                     })
                                     pre_log_probs = self.actor_rollout_wg.compute_log_prob(pre_prob_data)
                                     old_logp = aligned_old_logp
