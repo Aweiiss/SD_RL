@@ -110,6 +110,48 @@ def find_latest_logs(project_dir):
     return logs
 
 
+
+
+def _extract_shell_var(script_text: str, name: str):
+    m = re.search(rf"^\s*{re.escape(name)}=\$\{{{re.escape(name)}:-([^}}]+)\}}", script_text, flags=re.MULTILINE)
+    if m:
+        return m.group(1).strip().strip('"').strip("'")
+    return None
+
+
+def validate_config_consistency(exp_dir: Path, config_keys=None):
+    """Check key knobs are identical across 3 scripts before launching."""
+    if config_keys is None:
+        config_keys = [
+            "TOTAL_STEPS", "TRAIN_BATCH_SIZE", "ROLLOUT_N", "MAX_RESPONSE_LENGTH", "SEED"
+        ]
+
+    snapshots = {}
+    for cfg, meta in EXPERIMENTS.items():
+        script_path = exp_dir / meta["script"]
+        if not script_path.exists():
+            continue
+        txt = script_path.read_text()
+        snapshots[cfg] = {k: _extract_shell_var(txt, k) for k in config_keys}
+
+    if len(snapshots) < 2:
+        return True
+
+    baseline_cfg = "vanilla" if "vanilla" in snapshots else next(iter(snapshots))
+    baseline = snapshots[baseline_cfg]
+    ok = True
+
+    print_header("Preflight: key config consistency")
+    for k in config_keys:
+        vals = {cfg: snap.get(k) for cfg, snap in snapshots.items()}
+        uniq = {v for v in vals.values() if v is not None}
+        status = "OK" if len(uniq) <= 1 else "MISMATCH"
+        if status == "MISMATCH":
+            ok = False
+        print(f"  {k:<22} {status:<8} {vals}")
+
+    return ok
+
 def main():
     parser = argparse.ArgumentParser(description="Spec-RL 3-Config Experiment Manager")
     parser.add_argument("--project_dir", type=str, required=True, help="Project root directory")
@@ -131,6 +173,10 @@ def main():
     print(f"  Model: {args.model_path or '(use default)'}")
     print(f"  Data: {args.data_path or '(use default)'}")
     print(f"  GPUs: {args.num_gpu}")
+
+    if not validate_config_consistency(exp_dir):
+        print("[FATAL] Script configs are inconsistent across experiments. Please align key knobs first.")
+        sys.exit(1)
 
     # Determine which configs to run
     if args.config:

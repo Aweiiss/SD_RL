@@ -493,32 +493,45 @@ class RayPPOTrainer:
         """Dump rollout/validation samples as .pt (torch.save)."""
         os.makedirs(dump_path, exist_ok=True)
         filename = os.path.join(dump_path, f"{self.global_steps}.pt")
+        # Spec dump controls:
+        # - spec_dump_minimal_fields: keep only fields needed by speculative decoding
+        # - spec_dump_logp_fp16: store log_probs in fp16 to reduce disk and RAM pressure
+        dump_minimal = self.config.trainer.get("spec_dump_minimal_fields", True)
+        dump_logp_fp16 = self.config.trainer.get("spec_dump_logp_fp16", False)
 
         # sort uniformly (keep the same order as the original JSONL)
         order = sorted(range(len(inputs)), key=lambda i: inputs[i])
         order_idx = torch.tensor(order)
+        logp_dtype = torch.float16 if dump_logp_fp16 else torch.float32
+        logp_tensor = log_probs.index_select(0, order_idx).to(logp_dtype)
 
         # 1. reorder directly at tensor level
         data = {
             "step": torch.tensor(self.global_steps),
+            # required for align_prev_to_gen prompt matching
             "input": [inputs[i] for i in order],
-            "output": [outputs[i] for i in order],
-            "score": torch.tensor([scores[i] for i in order], dtype=torch.float32),
-            "log_probs": (log_probs.index_select(0, order_idx).to(torch.float32)),
+            "log_probs": logp_tensor,
             "response_masks": (response_masks.index_select(0, order_idx)),
             "responses": (responses.index_select(0, order_idx)),
             "position_ids": (position_ids.index_select(0, order_idx)),
-            "orig_idx": torch.tensor(order, dtype=torch.int32),
         }
 
+        if not dump_minimal:
+            data.update({
+                "output": [outputs[i] for i in order],
+                "score": torch.tensor([scores[i] for i in order], dtype=torch.float32),
+                "orig_idx": torch.tensor(order, dtype=torch.int32),
+            })
+
         # 2. other extra fields
-        for k, v in reward_extra_infos_dict.items():
-            if len(v) == len(inputs):
-                data[k] = (
-                    torch.tensor([v[i] for i in order]) if isinstance(v[0], int | float) else [v[i] for i in order]
-                )
-            else:
-                data[k] = v
+        if not dump_minimal:
+            for k, v in reward_extra_infos_dict.items():
+                if len(v) == len(inputs):
+                    data[k] = (
+                        torch.tensor([v[i] for i in order]) if isinstance(v[0], int | float) else [v[i] for i in order]
+                    )
+                else:
+                    data[k] = v
         # 3. save
         torch.save(data, filename)
         print(f"[dump] {len(inputs)} samples → {filename}")
@@ -1285,6 +1298,26 @@ class RayPPOTrainer:
             f"pt={sum(len(v) for v in pol_pt.values())}  files"
         )
 
+    def _load_prev_rollout_tensor(self, filepath: str):
+        """Load previous rollout tensor dict with a tiny bounded in-memory cache.
+
+        This reduces repeated disk I/O for adjacent steps while bounding memory use.
+        """
+        if self._prev_rollout_cache_max <= 0:
+            return torch.load(filepath, map_location="cpu", weights_only=False)
+
+        cached = self._prev_rollout_cache.get(filepath)
+        if cached is not None:
+            return cached
+
+        data = torch.load(filepath, map_location="cpu", weights_only=False)
+        self._prev_rollout_cache[filepath] = data
+        self._prev_rollout_cache_order.append(filepath)
+        while len(self._prev_rollout_cache_order) > self._prev_rollout_cache_max:
+            evict = self._prev_rollout_cache_order.popleft()
+            self._prev_rollout_cache.pop(evict, None)
+        return data
+
     def _compute_values(self, batch: DataProto) -> DataProto:
         batch_td = batch.to_tensordict()
         # step 2: convert from padding to nopadding
@@ -1486,6 +1519,10 @@ class RayPPOTrainer:
         self.latest_old_policy_tensor = defaultdict(list)
         self.adaptive_window_buckets = {}  # sid -> AdaptiveWindowBucket
         self.spec_stats = defaultdict(lambda: defaultdict(float))  # per-sid stats
+        # bounded in-memory cache for previous rollout tensors to reduce repeated disk load latency
+        self._prev_rollout_cache = {}
+        self._prev_rollout_cache_order = deque()
+        self._prev_rollout_cache_max = int(self.config.trainer.get("spec_prev_cache_size", 2))
 
         rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
         self.num_buckets = len(self.train_dataloader)
@@ -1579,7 +1616,7 @@ class RayPPOTrainer:
                                 with marked_timer("pre_log_probs", timing_raw, color="blue"):
                                     # prev_pts[-1] is (epoch, filepath); load the filepath
                                     prev_filepath = prev_pts[-1][1] if isinstance(prev_pts[-1], tuple) else prev_pts[-1]
-                                    prev_data = torch.load(prev_filepath, map_location="cpu", weights_only=False)
+                                    prev_data = self._load_prev_rollout_tensor(prev_filepath)
                                     N = self.config.actor_rollout_ref.rollout.n
                                     aligned = align_prev_to_gen(
                                         prev_data=prev_data,
@@ -1624,6 +1661,8 @@ class RayPPOTrainer:
                                         "input_ids": input_ids,
                                         "attention_mask": attention_mask,
                                         "position_ids": aligned_position_ids,
+                                        # optional key consumed by infer path; explicit default avoids branching mismatch
+                                        "no_lora_adapter": False,
                                     })
                                     pre_log_probs = self.actor_rollout_wg.compute_log_prob(pre_prob_data)
                                     old_logp = aligned_old_logp
