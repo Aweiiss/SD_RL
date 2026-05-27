@@ -688,11 +688,13 @@ def get(tensordict: TensorDict, key: str, default=None) -> Any:
     output = tensordict.get(key)
     if isinstance(output, torch.Tensor):
         return output
-    elif isinstance(output, NonTensorStack):
+    if isinstance(output, NonTensorStack):
         return output.tolist()
-    else:
-        assert isinstance(output, NonTensorData)
+    if isinstance(output, NonTensorData):
         return output.data
+    # DataProto.non_tensor_batch may contain plain Python objects (e.g. bool),
+    # not wrapped NonTensorData instances.
+    return output
 
 
 def get_keys(tensordict: TensorDict, keys: Iterable[str]) -> TensorDict:
